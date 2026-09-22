@@ -124,6 +124,92 @@ and (once approved) becomes installable.
 No. Skills live in the PowerContext store as Artifacts. To make one usable by an Agent, the application (or a
 Remote Skill Receiver) must explicitly download and install it to the Agent's working directory.
 
+## Middleware and MCP tools
+
+**Q: I see "Middleware" everywhere in the tutorials. What is it?**
+
+Middleware is an interception point exposed by LangChain's `create_agent`. It runs around the Agent's model call,
+letting a hook inject logic before or after the model is invoked. PowerContext ships a `PowerContextMiddleware`
+(in the `powercontext_langchain` package) that uses this hook to prepare context for the current turn, without
+modifying your Agent's reasoning loop. Other frameworks use different extension mechanisms; PowerContext
+integrates with them through MCP instead.
+
+**Q: When should I use Middleware vs MCP tools?**
+
+The two patterns answer different integration questions:
+
+| Pattern | When to use |
+| --- | --- |
+| **Middleware** | You want background context automatically injected before a model call that carries a user message. |
+| **MCP tools** | You want the Agent itself to decide when to call `search_memory`, `remember_memory`, or other PowerContext operations. |
+
+Middleware is passive — PowerContext decides what to inject. MCP tools are active — the model decides when to
+call them. They can be combined in the same Agent. See the
+[LangChain integration](../integrations/langchain.md) for setup, and [Interfaces](../develop/interfaces.md) for
+the full protocol surface.
+
+**Q: Does integrating PowerContext require rewriting my Agent?**
+
+No. PowerContext adds capability through Middleware or tools, without replacing your Agent's reasoning loop,
+message format, or existing tools. Adding the LangChain Middleware is a single extra argument:
+
+```python
+from langchain.agents import create_agent
+from powercontext_langchain import PowerContextMiddleware, PowerContextScope
+
+agent = create_agent(
+    model,
+    tools=application_tools,
+    middleware=[PowerContextMiddleware()],
+    context_schema=PowerContextScope,
+)
+
+result = await agent.ainvoke(
+    {"messages": [{"role": "user", "content": "..."}]},
+    context=PowerContextScope(),
+)
+```
+
+**Q: Does Middleware injection pollute my conversation history?**
+
+No. Injected content is single-use and never persisted to the Agent's state. Each model call gets a fresh
+injection, then it is discarded. Your conversation history contains only the messages the user and the model
+actually exchanged.
+
+**Q: What is MCP, and when does it matter?**
+
+MCP (Model Context Protocol) is an open protocol that lets any Agent connect to external tools and data sources
+through a standard interface. PowerContext exposes an MCP Server, so MCP-compatible Agents (Codex, Claude Code,
+and others) can use PowerContext without per-framework integration code. The MCP surface covers Memory search
+and write, Source capture, Handoff, and related operations.
+
+You typically reach for MCP tools when you want the Agent itself to decide when to read or write PowerContext,
+rather than having the application inject context automatically.
+
+**Q: Can I use Middleware and MCP tools together?**
+
+Yes. The two integrations live in separate packages (`powercontext_langchain` for Middleware,
+`powercontext_langgraph` for tools) and are designed to be combined in one Agent. A common pattern is Middleware
+for always-on background context plus tools for explicit, model-driven Memory writes:
+
+```python
+from langchain.agents import create_agent
+from powercontext_langchain import PowerContextMiddleware, PowerContextScope
+from powercontext_langgraph import powercontext_tools
+
+agent = create_agent(
+    model,
+    tools=powercontext_tools(),
+    middleware=[PowerContextMiddleware()],
+    context_schema=PowerContextScope,
+)
+
+result = await agent.ainvoke(
+    {"messages": [{"role": "user", "content": "..."}]},
+    context=PowerContextScope(),
+)
+```
+
 ## Still stuck?
 
 - For the underlying model, see [Core concepts](./core-concepts.md).

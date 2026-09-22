@@ -115,6 +115,88 @@ Skill。
 不会。Skill 作为 Artifact 存储在 PowerContext 中。要让 Agent 能使用它，应用（或 Remote Skill Receiver）必
 须显式下载并安装到 Agent 的工作目录。
 
+## Middleware 与 MCP 工具
+
+**问：教程里经常看到"Middleware"，它是什么？**
+
+Middleware 是 LangChain 的 `create_agent` 暴露的拦截点。它运行在 Agent 调用模型的前后，允许你在这个阶段
+插入自定义逻辑。PowerContext 提供的 `PowerContextMiddleware`（位于 `powercontext_langchain` 包中）就利用这
+个钩子，为当前这一轮调用准备上下文，但不会修改 Agent 的推理循环。其他框架使用不同的扩展机制；
+PowerContext 通过 MCP 与它们集成。
+
+**问：什么时候用 Middleware，什么时候用 MCP 工具？**
+
+这两种模式回答的是不同的接入问题：
+
+| 模式 | 适用场景 |
+| --- | --- |
+| **Middleware** | 希望在携带用户消息的模型调用前自动注入背景上下文。 |
+| **MCP 工具** | 希望由 Agent 自己决定何时调用 `search_memory`、`remember_memory` 等 PowerContext 操作。 |
+
+Middleware 是被动方式——由 PowerContext 决定注入什么。MCP 工具是主动方式——由模型决定何时调用。两者可以
+在同一个 Agent 中同时使用。安装与配置详见 [LangChain 集成](../integrations/langchain.md)；完整协议说明
+见 [接口](../develop/interfaces.md)。
+
+**问：接入 PowerContext 需要重写我的 Agent 吗？**
+
+不需要。PowerContext 通过 Middleware 或工具为 Agent 增加能力，不替换 Agent 的推理循环、消息格式或已有工
+具。接入 LangChain Middleware 只需要多传一个参数：
+
+```python
+from langchain.agents import create_agent
+from powercontext_langchain import PowerContextMiddleware, PowerContextScope
+
+agent = create_agent(
+    model,
+    tools=application_tools,
+    middleware=[PowerContextMiddleware()],
+    context_schema=PowerContextScope,
+)
+
+result = await agent.ainvoke(
+    {"messages": [{"role": "user", "content": "..."}]},
+    context=PowerContextScope(),
+)
+```
+
+**问：Middleware 注入的内容会污染会话历史吗？**
+
+不会。注入的内容只在单次调用中生效，并且永远不会写入 Agent 的状态。每次调用模型时都会重新注入一次，之
+后便丢弃。会话历史中只保留用户与模型真实交互的消息。
+
+**问：MCP 是什么？它解决了什么问题？**
+
+MCP（Model Context Protocol，模型上下文协议）是一个开放协议，让任意 Agent 都能通过标准接口接入外部工具
+和数据源。PowerContext 提供 MCP Server，因此兼容 MCP 的 Agent（如 Codex、Claude Code 等）可以直接使用
+PowerContext，而不需要为每个框架单独写集成代码。MCP 暴露的能力覆盖 Memory 检索与写入、Source 采集、
+Handoff 等相关操作。
+
+通常在希望 Agent 主动决定何时读写 PowerContext 时选择 MCP 工具，而不是由应用自动注入上下文。
+
+**问：可以同时使用 Middleware 和 MCP 工具吗？**
+
+可以。这两个集成位于不同的包中（Middleware 在 `powercontext_langchain`，工具在 `powercontext_langgraph`），
+设计上就是为了在同一个 Agent 中组合使用。一种常见的组合是：用 Middleware 提供"始终在线"的背景上下文，用
+MCP 工具支持由模型主动发起的 Memory 写入：
+
+```python
+from langchain.agents import create_agent
+from powercontext_langchain import PowerContextMiddleware, PowerContextScope
+from powercontext_langgraph import powercontext_tools
+
+agent = create_agent(
+    model,
+    tools=powercontext_tools(),
+    middleware=[PowerContextMiddleware()],
+    context_schema=PowerContextScope,
+)
+
+result = await agent.ainvoke(
+    {"messages": [{"role": "user", "content": "..."}]},
+    context=PowerContextScope(),
+)
+```
+
 ## 还有疑问？
 
 - 概念模型请见[核心概念](./core-concepts.md)。
