@@ -124,34 +124,40 @@ and (once approved) becomes installable.
 No. Skills live in the PowerContext store as Artifacts. To make one usable by an Agent, the application (or a
 Remote Skill Receiver) must explicitly download and install it to the Agent's working directory.
 
-## Middleware and MCP tools
+## Middleware, tools, and MCP
 
 **Q: I see "Middleware" everywhere in the tutorials. What is it?**
 
-Middleware is an interception point exposed by LangChain's `create_agent`. It runs around the Agent's model call,
-letting a hook inject logic before or after the model is invoked. PowerContext ships a `PowerContextMiddleware`
-(in the `powercontext_langchain` package) that uses this hook to prepare context for the current turn, without
-modifying your Agent's reasoning loop. Other frameworks use different extension mechanisms; PowerContext
-integrates with them through MCP instead.
+Middleware adds behavior around an Agent's model or tool calls. PowerContext's LangChain adapter,
+`PowerContextMiddleware`, uses LangChain's public middleware API to prepare bounded context from the latest
+non-empty user message before a model call. When recall returns content, it adds an untrusted historical
+context block to that model request, without replacing the Agent's core loop.
 
 **Q: When should I use Middleware vs MCP tools?**
 
-The two patterns answer different integration questions:
+First distinguish automatic recall from explicit tool calls; then choose how to connect those tools:
 
-| Pattern | When to use |
+| Integration | Behavior and connection |
 | --- | --- |
-| **Middleware** | You want background context automatically injected before a model call that carries a user message. |
-| **MCP tools** | You want the Agent itself to decide when to call `search_memory`, `remember_memory`, or other PowerContext operations. |
+| **LangChain Middleware** | Requests context over HTTP before eligible model calls, without waiting for the model to request a search. |
+| **LangGraph tools** | `powercontext_tools()` supplies native LangChain tools for explicit Memory operations through the Python HTTP Client. No MCP connection is involved. |
+| **MCP tools** | A configured MCP client discovers and invokes the Server's exposed tools. The host application can call them directly or offer them to a model. |
 
-Middleware is passive — PowerContext decides what to inject. MCP tools are active — the model decides when to
-call them. They can be combined in the same Agent. See the
-[LangChain integration](../integrations/langchain.md) for setup, and [Interfaces](../develop/interfaces.md) for
-the full protocol surface.
+For example, Middleware can supply the CSV project's amount constraints, while an explicit tool saves a new
+user-confirmed rule. Tool-driven Memory access does not require MCP; MCP is a protocol, not a rule about who
+triggers an operation. See [LangChain](../integrations/langchain.md), [LangGraph](../integrations/langgraph.md),
+and [Choose an interface](../develop/interfaces.md) for setup and available operations.
 
 **Q: Does integrating PowerContext require rewriting my Agent?**
 
-No. PowerContext adds capability through Middleware or tools, without replacing your Agent's reasoning loop,
-message format, or existing tools. Adding the LangChain Middleware is a single extra argument:
+Not for the supported LangChain integration. Keep your model and application tools, install the adapter, and
+configure its connection to a running PowerContext Server. The following wiring example assumes `model` and
+`application_tools` already exist, `server_url` is the Server's HTTP base URL, `scope_id` identifies an existing
+Scope you may access, `token` is a bare bearer token or `None` for an unauthenticated Server, and `question` is
+the current user input. Both examples assume HTTPS for a remote Server or HTTP at a loopback address.
+Where access control is enforced, the caller also needs permission to resolve the Scope and perform the
+requested Memory operations; see [Scopes and access](../workflows/scopes-and-access.md).
+The Agent calls use the async API:
 
 ```python
 from langchain.agents import create_agent
@@ -165,50 +171,74 @@ agent = create_agent(
 )
 
 result = await agent.ainvoke(
-    {"messages": [{"role": "user", "content": "..."}]},
-    context=PowerContextScope(),
+    {"messages": [{"role": "user", "content": question}]},
+    context=PowerContextScope(scope_id=scope_id, base_url=server_url, token=token),
 )
 ```
 
+This Scope object configures the LangChain middleware, not the separate LangGraph tools. Fields left as
+`None` fall back to the middleware's settings; omit its token setting when using an unauthenticated Server.
+
 **Q: Does Middleware injection pollute my conversation history?**
 
-No. Injected content is single-use and never persisted to the Agent's state. Each model call gets a fresh
-injection, then it is discarded. Your conversation history contains only the messages the user and the model
-actually exchanged.
+The injected context block changes only the current model request; the middleware does not append it to Agent
+state or a checkpointer. Later model calls can request context again using the latest user message. Ordinary
+conversation and tool messages remain subject to the application's history policy, and information repeated
+in an assistant's answer can remain in that history. Optional completed-turn Source capture is a separate,
+default-off feature; see the [LangChain recall and capture lifecycle](../integrations/langchain.md).
 
 **Q: What is MCP, and when does it matter?**
 
-MCP (Model Context Protocol) is an open protocol that lets any Agent connect to external tools and data sources
-through a standard interface. PowerContext exposes an MCP Server, so MCP-compatible Agents (Codex, Claude Code,
-and others) can use PowerContext without per-framework integration code. The MCP surface covers Memory search
-and write, Source capture, Handoff, and related operations.
+MCP (Model Context Protocol) standardizes how compatible clients discover and call tools exposed by a Server.
+Use PowerContext's MCP endpoint when your host supports MCP and you want that tool interface. The host still
+needs the connection, authentication, and Scope configuration appropriate to the exposed operations.
+`powercontext_tools()` is not an MCP client: its Memory tools call HTTP endpoints such as
+`/v1/memory/remember`, and work with MCP disabled. The MCP tool catalog is a separate, curated interface rather
+than the complete HTTP API; see [Choose an interface](../develop/interfaces.md).
 
-You typically reach for MCP tools when you want the Agent itself to decide when to read or write PowerContext,
-rather than having the application inject context automatically.
+**Q: Can I combine Middleware with explicit Memory tools?**
 
-**Q: Can I use Middleware and MCP tools together?**
+Yes, but their configurations must agree. The following example combines **LangChain Middleware and
+HTTP-backed LangGraph tools**, not MCP tools. Each package defines its own `PowerContextScope` class; the
+LangGraph tools do not recognize a LangChain Scope object and instead fall back to `POWERCONTEXT_LANGGRAPH_*`.
+Passing `PowerContextScope(scope_id=...)` from the LangChain package therefore does not configure tool writes.
 
-Yes. The two integrations live in separate packages (`powercontext_langchain` for Middleware,
-`powercontext_langgraph` for tools) and are designed to be combined in one Agent. A common pattern is Middleware
-for always-on background context plus tools for explicit, model-driven Memory writes:
+For a single-Scope application process, set both integrations' connection, Scope, and token settings from the
+same values before starting the Agent. This example uses the `model`, `server_url`, `scope_id`, `token`, and
+`question` described above and deliberately passes neither package's Scope object:
 
 ```python
+import os
+
 from langchain.agents import create_agent
-from powercontext_langchain import PowerContextMiddleware, PowerContextScope
+from powercontext_langchain import PowerContextMiddleware
 from powercontext_langgraph import powercontext_tools
+
+connection = {"BASE_URL": server_url, "SCOPE_ID": scope_id, "TOKEN": token}
+for prefix in ("POWERCONTEXT_LANGCHAIN", "POWERCONTEXT_LANGGRAPH"):
+    for key, value in connection.items():
+        name = f"{prefix}_{key}"
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 agent = create_agent(
     model,
     tools=powercontext_tools(),
     middleware=[PowerContextMiddleware()],
-    context_schema=PowerContextScope,
 )
 
 result = await agent.ainvoke(
-    {"messages": [{"role": "user", "content": "..."}]},
-    context=PowerContextScope(),
+    {"messages": [{"role": "user", "content": question}]},
 )
 ```
+
+Obtain credentials from your application's secret configuration, not a hard-coded token. Environment settings
+are process-wide: configure them once at startup, not per request in a concurrent multi-Scope application.
+Do not assume a later LangChain Scope override also redirects the tools. Verify both the recalled Scope and
+the stored entry's Scope. See [LangChain connection and Scope settings](../integrations/langchain.md#configure-connection-and-scope)
+and [LangGraph connection settings](../integrations/langgraph.md#configure-the-connection).
 
 ## Still stuck?
 
