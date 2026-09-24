@@ -108,7 +108,7 @@ async def _await_usage_record(database, scope):
     """
 
     async with asyncio.timeout(5):
-        while _topic_embedding_requests(database, scope) == 0:
+        while _topic_embedding_requests(database, scope) == 0:  # noqa: ASYNC110 - bounded observation of committed database state
             await asyncio.sleep(0.02)
 
 
