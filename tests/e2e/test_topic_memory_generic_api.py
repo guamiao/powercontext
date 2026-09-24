@@ -449,12 +449,28 @@ def test_concurrent_writes_under_a_held_writer_lock_keep_every_usage_record(tmp_
     Concurrency alone does not reproduce the report, because an in-memory model
     yields no long await. The lock has to be held across the requests, which is
     what a slow generation or embedding call does in a real deployment.
+
+    The three budgets must stay ordered, or the test measures the wrong thing:
+
+        embedding timeout  <  lock hold  <  busy timeout
+
+    Holding the lock past the busy timeout fails the *business* write on its own
+    terms, which has nothing to do with accounting; holding it below the embedding
+    timeout leaves the original defect unexercised.
     """
 
     writes = 6
+    embedding_timeout = 0.2
+    lock_hold_seconds = 0.6
+    busy_timeout_ms = 2_000
 
     async def scenario():
-        app = _app(tmp_path, UsageEmbeddings(), embedding_timeout=0.1, busy_timeout_ms=300)
+        app = _app(
+            tmp_path,
+            UsageEmbeddings(),
+            embedding_timeout=embedding_timeout,
+            busy_timeout_ms=busy_timeout_ms,
+        )
         async with (
             app.router.lifespan_context(app),
             httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
@@ -471,7 +487,7 @@ def test_concurrent_writes_under_a_held_writer_lock_keep_every_usage_record(tmp_
                 holder.execute("SELECT * FROM pc_scopes").fetchall()
 
                 async def release_later() -> None:
-                    await asyncio.sleep(0.35)
+                    await asyncio.sleep(lock_hold_seconds)
                     holder.rollback()
 
                 releasing = asyncio.create_task(release_later())
