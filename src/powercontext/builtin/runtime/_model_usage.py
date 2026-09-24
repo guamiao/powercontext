@@ -34,8 +34,10 @@ from powercontext.builtin.statistics import ModelUsageOperation, ModelUsagePurpo
 
 _LOGGER = logging.getLogger(__name__)
 
-# One record's budget is spent in slices so a write that keeps losing the lock
-# still gets a bounded number of independent attempts instead of one long wait.
+# A contended attempt on SQLite usually returns at once: the transaction begins
+# deferred, and the write upgrade does not consult the busy handler. The budget
+# bounds the retry window, and the backoff interval bounds how many attempts fit
+# inside it; the slice below only caps a single attempt that does wait.
 _WRITE_ATTEMPT_SLICES = 4
 _MIN_WRITE_ATTEMPT_SECONDS = 0.02
 _RETRY_BACKOFF_SECONDS = 0.02
@@ -198,9 +200,10 @@ class _ModelUsageRecorder:
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._write_timeout_seconds
-        # A fixed slice per attempt keeps the attempt count within the documented
-        # budget; re-slicing the remaining budget each pass would multiply the
-        # attempts and the connection churn a contended writer already causes.
+        # A fixed slice per attempt rather than a re-sliced remainder, so one
+        # attempt that really does wait cannot consume the whole budget. Contended
+        # attempts normally return immediately, so the backoff interval, not this
+        # slice, is what decides how many attempts fit inside the deadline.
         attempt_timeout = max(self._write_timeout_seconds / _WRITE_ATTEMPT_SLICES, _MIN_WRITE_ATTEMPT_SECONDS)
         while True:
             remaining = deadline - loop.time()

@@ -450,13 +450,15 @@ def test_concurrent_writes_under_a_held_writer_lock_keep_every_usage_record(tmp_
     yields no long await. The lock has to be held across the requests, which is
     what a slow generation or embedding call does in a real deployment.
 
-    The three budgets must stay ordered, or the test measures the wrong thing:
+    The budgets must stay ordered, or the test measures the wrong thing:
 
         embedding timeout  <  lock hold  <  busy timeout
+                            lock hold  <  record write budget
 
     Holding the lock past the busy timeout fails the *business* write on its own
     terms, which has nothing to do with accounting; holding it below the embedding
-    timeout leaves the original defect unexercised.
+    timeout leaves the original defect unexercised; holding it past the recorder's
+    own write budget lets a record be dropped before the final count is read.
     """
 
     writes = 6
