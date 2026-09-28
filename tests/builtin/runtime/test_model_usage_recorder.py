@@ -18,15 +18,17 @@ import asyncio
 import logging
 import sqlite3
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import date
 from pathlib import Path
 from threading import Event as ThreadEvent
+from typing import cast
 
 import pytest
 from aiosqlite import Connection as SQLiteConnection
 from sqlalchemy import delete, event, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.pool import QueuePool
 from sqlalchemy.util import await_only
 
 from powercontext.builtin.inference import InferenceUsage
@@ -341,6 +343,62 @@ def test_usage_checkout_budget_releases_pool_resources(
         finally:
             release.set()
             await database.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_stalled_driver_read_is_cancelled_and_returns_its_pool_slot() -> None:
+    """The stall the SQLite cases cannot reach: a driver-level socket read.
+
+    The reviewer's stall is inside aiomysql, waiting on a server that never
+    answers; `pool_timeout` does not bound that read. Nothing here is SQLite, so
+    this is the only case that shows the checkout really is cancellable through
+    the driver, and that the interrupted attempt gives its pool slot back
+    instead of holding it past shutdown.
+    """
+
+    async def scenario() -> None:
+        held: list[asyncio.StreamWriter] = []
+
+        async def accept_and_never_answer(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            # Keeping the writer open leaves the client blocked on its first
+            # read, with no reply and no reset, until it gives up or is cancelled.
+            held.append(writer)
+
+        server = await asyncio.start_server(accept_and_never_answer, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        engine = create_async_engine(
+            f"mysql+aiomysql://root:secret@127.0.0.1:{port}/powercontext",
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=60,
+            pool_pre_ping=True,
+        )
+        database = AsyncDatabase.own(engine)
+
+        async def attempt() -> None:
+            async with database._model_usage_transaction(0.05):
+                pytest.fail("A stalled driver read exceeded its usage budget")
+
+        # Failing fast beats hanging: without the checkout bound this task never
+        # finishes at all, so wait on it instead of awaiting it directly.
+        attempt_task = asyncio.create_task(attempt())
+        try:
+            done, _ = await asyncio.wait({attempt_task}, timeout=5)
+            assert done, "the usage budget did not bound the stalled driver read"
+            with pytest.raises(TimeoutError):
+                await attempt_task
+            await asyncio.wait_for(database.close(), 2)
+            assert cast(QueuePool, engine.pool).checkedout() == 0, "the abandoned checkout kept its pool slot"
+        finally:
+            server.close()
+            for writer in held:
+                writer.close()
+            attempt_task.cancel()
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(attempt_task, 1)
+            with suppress(asyncio.CancelledError, TimeoutError):
+                await asyncio.wait_for(database.close(), 2)
 
     asyncio.run(scenario())
 
