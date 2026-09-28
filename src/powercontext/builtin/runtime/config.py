@@ -40,6 +40,7 @@ from powercontext.builtin.artifacts.topic_memory.generation import (
     topic_memory_stage_budget,
     validate_topic_memory_stage_capacity,
 )
+from powercontext.builtin.code.models import CodeConfig
 from powercontext.builtin.dream.models import DreamBudget
 from powercontext.builtin.inference import character_token_estimator
 from powercontext.builtin.persistence.oceanbase import OceanBaseConfig
@@ -140,6 +141,7 @@ class RuntimeConfig(BaseModel):
     memory_extraction_profile: MemoryExtractionProfile = MemoryExtractionProfile.CODING
     memory_rerank_enabled: bool = False
     memory_rerank_candidate_limit: int = Field(default=30, ge=1, le=100)
+    decision_assistance_enabled: bool = False
     recall_gate_enabled: bool = False
     recall_gate_max_rounds: int = Field(default=2, ge=0, le=2)
     recall_gate_min_candidates: int = Field(default=2, ge=1)
@@ -256,8 +258,14 @@ class InferenceConfig(BaseModel):
     rerank_model_settings: dict[str, JsonValue] = Field(default_factory=dict)
     rerank_timeout_seconds: float | None = Field(default=None, gt=0)
     rerank_max_requests: int | None = Field(default=None, ge=1)
+    decision_model: str | None = None
+    decision_base_url: AnyHttpUrl | None = None
+    decision_headers: dict[str, SecretStr] = Field(default_factory=dict, repr=False)
+    decision_model_settings: dict[str, JsonValue] = Field(default_factory=dict)
+    decision_timeout_seconds: float | None = Field(default=None, gt=0)
+    decision_max_requests: int | None = Field(default=None, ge=1)
 
-    @field_validator("generation_model", "embedding_model", "embedding_profile_id", "rerank_model")
+    @field_validator("generation_model", "embedding_model", "embedding_profile_id", "rerank_model", "decision_model")
     @classmethod
     def validate_optional_identifier(cls, value: str | None) -> str | None:
         if value is None:
@@ -277,7 +285,7 @@ class InferenceConfig(BaseModel):
             raise ValueError("embedding normalization must be 'none' or 'unit'")  # noqa: TRY003
         return normalized
 
-    @field_validator("generation_headers", "embedding_headers", "rerank_headers")
+    @field_validator("generation_headers", "embedding_headers", "rerank_headers", "decision_headers")
     @classmethod
     def validate_headers(cls, value: dict[str, SecretStr]) -> dict[str, SecretStr]:
         normalized_names: set[str] = set()
@@ -292,7 +300,12 @@ class InferenceConfig(BaseModel):
             normalized_names.add(normalized_name)
         return value
 
-    @field_validator("generation_model_settings", "embedding_model_settings", "rerank_model_settings")
+    @field_validator(
+        "generation_model_settings",
+        "embedding_model_settings",
+        "rerank_model_settings",
+        "decision_model_settings",
+    )
     @classmethod
     def reserve_headers_field(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
         if "extra_headers" in value:
@@ -328,6 +341,7 @@ class InferenceConfig(BaseModel):
             and (self.rerank_headers or self.rerank_model_settings)
         ):
             raise ValueError("rerank overrides require rerank_model or generation_model")  # noqa: TRY003
+        self._validate_decision_overrides()
         max_tokens = self.generation_model_settings.get("max_tokens")
         if max_tokens is not None and (
             not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1
@@ -346,6 +360,18 @@ class InferenceConfig(BaseModel):
                     f"Topic Memory generation budget is invalid: {error.error_code}"
                 ) from error
         return self
+
+    def _validate_decision_overrides(self) -> None:
+        """Keep the decision workload's endpoint overrides consistent with its model."""
+
+        if self.decision_base_url is not None and self.decision_model is None:
+            raise ValueError("decision_base_url requires decision_model")  # noqa: TRY003
+        if (
+            self.decision_model is None
+            and self.generation_model is None
+            and (self.decision_headers or self.decision_model_settings)
+        ):
+            raise ValueError("decision overrides require decision_model or generation_model")  # noqa: TRY003
 
 
 class ExternalSkillsConfig(BaseModel):
@@ -400,6 +426,7 @@ def normalize_database_discriminator(value: Any) -> Any:
 class BuiltinConfig(BaseModel):
     """Configuration for one built-in runtime and its database."""
 
+    code: CodeConfig = Field(default_factory=CodeConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     database: DatabaseConfig = Field(default_factory=SQLiteConfig, discriminator="kind")
     handoff_report: HandoffReportConfig = Field(default_factory=HandoffReportConfig)
