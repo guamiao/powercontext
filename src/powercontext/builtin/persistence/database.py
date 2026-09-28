@@ -128,12 +128,12 @@ class AsyncDatabase:
                     await guard.acquire()
                 acquired = True
             connection = self._engine.connect()
-            # Never cancel checkout. AsyncConnection.start assigns the pooled
-            # connection only after its greenlet returns, so a cancelled start
-            # abandons a connection that was already checked out. The pool's own
-            # timeout bounds this, and a stalled recorder costs only telemetry.
-            await connection.start()
             try:
+                # Pool timeout only bounds waiting for a slot, not pre-ping or
+                # the driver's handshake. SQLAlchemy returns an interrupted
+                # checkout to the pool; aiomysql closes cancelled socket reads.
+                async with asyncio.timeout_at(deadline):
+                    await connection.start()
                 if connection.dialect.name == "sqlite":
                     async with _sqlite_model_usage_transaction(connection, deadline):
                         yield connection
@@ -141,7 +141,11 @@ class AsyncDatabase:
                     async with _mysql_model_usage_transaction(connection, deadline):
                         yield connection
             finally:
-                await connection.close()
+                # A completed checkout belongs to us, even if cancellation
+                # arrives before the transaction starts. Keep the shared lock
+                # until close finishes so pool reset cannot roll back business.
+                if connection.sync_connection is not None:
+                    await connection.close()
         finally:
             if acquired and guard is not None:
                 guard.release()

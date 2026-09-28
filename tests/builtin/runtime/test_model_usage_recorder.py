@@ -25,8 +25,9 @@ from threading import Event as ThreadEvent
 
 import pytest
 from aiosqlite import Connection as SQLiteConnection
-from sqlalchemy import delete, insert, select, update
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy import delete, event, insert, select, update
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.util import await_only
 
 from powercontext.builtin.inference import InferenceUsage
 from powercontext.builtin.persistence.database import AsyncDatabase
@@ -251,6 +252,172 @@ def test_close_under_a_held_writer_lock_is_bounded(tmp_path: Path) -> None:
             # Dropping the contended record is allowed; wedging the database is not.
             assert await _rows(database) == ()
             await _assert_connection_restored(database)
+
+    asyncio.run(scenario())
+
+
+def test_checkout_that_outlives_its_budget_does_not_hold_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        config = SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'slow-checkout.db'}")
+        async with _database(config) as database:
+            original_start = AsyncConnection.start
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            finished = asyncio.Event()
+
+            async def start(connection: AsyncConnection, is_ctxmanager: bool = False) -> AsyncConnection:
+                if not entered.is_set():
+                    entered.set()
+                    try:
+                        await release.wait()
+                    finally:
+                        finished.set()
+                return await original_start(connection, is_ctxmanager)
+
+            monkeypatch.setattr(AsyncConnection, "start", start)
+            recorder = _ModelUsageRecorder(
+                database, StatisticsRepository(), write_timeout_seconds=0.05, flush_timeout_seconds=0.02
+            )
+            try:
+                _offer(recorder)
+                await asyncio.wait_for(entered.wait(), 1)
+                await asyncio.wait_for(recorder.close(), 1)
+                await asyncio.wait_for(database.close(), 0.8)
+                # Shutdown must finish the abandoned checkout, not merely stop
+                # counting it while leaving another task waiting on the pool.
+                assert finished.is_set()
+            finally:
+                release.set()
+                await recorder.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stall", ["pool", "pre_ping"])
+def test_usage_checkout_budget_releases_pool_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stall: str
+) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'checkout-pool.db'}",
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout=60,
+            pool_pre_ping=True,
+        )
+        database = AsyncDatabase.own(engine)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        try:
+            # Warm the pool so the next checkout takes the pre-ping path.
+            await database.ping()
+            original_ping = engine.sync_engine.dialect.do_ping
+
+            def stalled_ping(connection):
+                entered.set()
+                await_only(release.wait())
+                return original_ping(connection)
+
+            async def attempt() -> None:
+                with pytest.raises(TimeoutError):
+                    async with database._model_usage_transaction(0.05):
+                        pytest.fail("A stalled checkout exceeded its usage budget")
+
+            if stall == "pool":
+                async with engine.connect() as business:
+                    await asyncio.wait_for(attempt(), 1)
+                    # Return the sole slot, then acquire it again. An abandoned
+                    # checkout would take it and could hold it past shutdown.
+                    assert not business.closed
+            else:
+                monkeypatch.setattr(engine.sync_engine.dialect, "do_ping", stalled_ping)
+                await asyncio.wait_for(attempt(), 1)
+                assert entered.is_set()
+                monkeypatch.setattr(engine.sync_engine.dialect, "do_ping", original_ping)
+            await asyncio.wait_for(database.ping(), 1)
+            await asyncio.wait_for(database.close(), 1)
+        finally:
+            release.set()
+            await database.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancellation_at_checkout_returns_the_connection(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{tmp_path / 'cancel-checkout.db'}", pool_size=1, max_overflow=0, pool_timeout=60
+        )
+        database = AsyncDatabase.own(engine)
+        try:
+            await database.ping()
+
+            async def attempt() -> None:
+                owner = asyncio.current_task()
+                assert owner is not None
+
+                def cancel_on_checkout(*args) -> None:
+                    asyncio.get_running_loop().call_soon(owner.cancel)
+
+                event.listen(engine.sync_engine, "checkout", cancel_on_checkout, once=True)
+                async with database._model_usage_transaction(1):
+                    pytest.fail("Cancellation must propagate before usage is written")
+
+            attempt_task = asyncio.create_task(attempt())
+            with pytest.raises(asyncio.CancelledError):
+                await attempt_task
+            # With only one pool slot this also detects a leaked checkout.
+            await asyncio.wait_for(database.ping(), 1)
+        finally:
+            await database.close()
+
+    asyncio.run(scenario())
+
+
+def test_timed_out_shared_checkout_cannot_roll_back_business(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        async with _database() as database:
+            original_start = AsyncConnection.start
+            original_close = AsyncConnection.close
+            release = asyncio.Event()
+            settled = asyncio.Event()
+            stalled_connection: AsyncConnection | None = None
+
+            async def start(connection: AsyncConnection, is_ctxmanager: bool = False) -> AsyncConnection:
+                nonlocal stalled_connection
+                if stalled_connection is None:
+                    stalled_connection = connection
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        settled.set()
+                        raise
+                return await original_start(connection, is_ctxmanager)
+
+            async def close(connection: AsyncConnection) -> None:
+                try:
+                    await original_close(connection)
+                finally:
+                    if connection is stalled_connection:
+                        settled.set()
+
+            monkeypatch.setattr(AsyncConnection, "start", start)
+            monkeypatch.setattr(AsyncConnection, "close", close)
+            try:
+                with pytest.raises(TimeoutError):
+                    async with database._model_usage_transaction(0.02):
+                        pytest.fail("The stalled checkout must time out")
+                async with database.transaction() as connection:
+                    await connection.execute(update(SCOPES_TABLE).values(title="committed"))
+                    release.set()
+                    await asyncio.wait_for(settled.wait(), 1)
+                    assert (await connection.execute(select(SCOPES_TABLE.c.title))).scalar_one() == "committed"
+                async with database.transaction() as connection:
+                    assert (await connection.execute(select(SCOPES_TABLE.c.title))).scalar_one() == "committed"
+            finally:
+                release.set()
 
     asyncio.run(scenario())
 

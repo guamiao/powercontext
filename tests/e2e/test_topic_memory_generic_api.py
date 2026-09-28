@@ -51,11 +51,21 @@ class UsageEmbeddings(Embeddings):
         return result.model_copy(update={"usage": InferenceUsage(requests=1, input_tokens=len(texts), output_tokens=0)})
 
 
-def _app(tmp_path, embedding=None, *, embedding_timeout=30.0, busy_timeout_ms=5_000):
+def _app(
+    tmp_path,
+    embedding=None,
+    *,
+    embedding_timeout=30.0,
+    busy_timeout_ms=5_000,
+    model_usage_write_timeout_seconds=1.0,
+):
     return create_server_app(
         settings=ServerSettings(
             database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'topics.db'}", busy_timeout_ms=busy_timeout_ms),
-            runtime=RuntimeConfig(artifact_processing_families=()),
+            runtime=RuntimeConfig(
+                artifact_processing_families=(),
+                model_usage_write_timeout_seconds=model_usage_write_timeout_seconds,
+            ),
             inference=InferenceConfig(embedding_timeout_seconds=embedding_timeout),
             auth=BearerAuthConfig(enabled=False),
             access=AccessControlConfig(mode="disabled"),
@@ -432,7 +442,9 @@ def test_stalled_usage_write_does_not_delay_or_fail_the_topic_write(tmp_path, mo
             await release.wait()
             return await original(repository, connection, *args)
 
-        app = _app(tmp_path, UsageEmbeddings())
+        # This test stalls the recorder itself, so the budget must stay far beyond
+        # the hold: a record dropped for spending its budget is never entered.
+        app = _app(tmp_path, UsageEmbeddings(), model_usage_write_timeout_seconds=30.0)
         async with (
             app.router.lifespan_context(app),
             httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
@@ -481,6 +493,7 @@ def test_concurrent_writes_under_a_held_writer_lock_keep_every_usage_record(tmp_
     embedding_timeout = 0.2
     lock_hold_seconds = 0.6
     busy_timeout_ms = 2_000
+    record_write_budget = 3.0
 
     async def scenario():
         app = _app(
@@ -488,6 +501,7 @@ def test_concurrent_writes_under_a_held_writer_lock_keep_every_usage_record(tmp_
             UsageEmbeddings(),
             embedding_timeout=embedding_timeout,
             busy_timeout_ms=busy_timeout_ms,
+            model_usage_write_timeout_seconds=record_write_budget,
         )
         async with (
             app.router.lifespan_context(app),
@@ -518,9 +532,9 @@ def test_concurrent_writes_under_a_held_writer_lock_keep_every_usage_record(tmp_
 
     asyncio.run(scenario())
 
-    # Drain at shutdown, not at the request boundary: the competing lock outlives
-    # a single record's budget here, so this asserts that no already-accepted
-    # record is lost once contention ends.
+    # Drain at shutdown: the competing lock can outlast a request's flush
+    # checkpoint, but must end inside the recorder's write budget.
+    # Every accepted record must be present once contention ends.
     assert _topic_embedding_requests(tmp_path / "topics.db") == writes
 
 
@@ -559,7 +573,9 @@ def test_cancelling_a_request_during_a_stalled_usage_write_leaves_the_runtime_he
             await release.wait()
             return await original(repository, connection, *args)
 
-        app = _app(tmp_path, UsageEmbeddings())
+        # As above: the stalled write must be reached rather than dropped for
+        # spending its budget on a slow machine.
+        app = _app(tmp_path, UsageEmbeddings(), model_usage_write_timeout_seconds=30.0)
         async with (
             app.router.lifespan_context(app),
             httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
