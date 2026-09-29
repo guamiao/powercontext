@@ -23,6 +23,7 @@ import aiosqlite
 import anyio
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import Connection as SyncConnection
 from sqlalchemy import event, func, insert, select
 from sqlalchemy.exc import IntegrityError, PendingRollbackError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
@@ -430,7 +431,7 @@ def test_marker_recorded_during_commit_does_not_survive_the_transaction(tmp_path
         async with SQLiteProfile.open(config, tables=()) as profile:
             database = profile.database
 
-            def plant_mark(connection: object) -> None:
+            def plant_mark(connection: SyncConnection) -> None:
                 connection.info["_powercontext_sqlite_interrupted"] = True
 
             event.listen(database.engine.sync_engine, "commit", plant_mark)
