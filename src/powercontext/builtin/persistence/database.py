@@ -109,9 +109,8 @@ class AsyncDatabase:
         """
 
         if self._shared_connection is not None and self._transaction_owner is asyncio.current_task():
-            # Nested lookups on a single-connection profile join their caller's
-            # transaction, not acquire or commit that connection again. Only the
-            # owner runs cleanup, so a nested exit cannot close the caller's cursors.
+            # Nested lookups join their caller's transaction. Only its owner
+            # runs connection cleanup, so nested exits cannot close its cursors.
             connection = self._shared_connection
             if consistent_snapshot and connection.dialect.name != "sqlite":
                 raise PersistenceError("cannot establish a snapshot inside an existing transaction")  # noqa: TRY003
